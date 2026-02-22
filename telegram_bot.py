@@ -1,6 +1,9 @@
 import os
 import logging
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from openpyxl import Workbook, load_workbook
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
@@ -63,7 +66,6 @@ def save_to_excel(user_id, username, file_name):
 # =========================
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     print("PHOTO RECEIVED")
 
     user = update.effective_user
@@ -85,6 +87,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ عکس دریافت و ثبت شد")
 
 # =========================
+# Railway Health Server (برای جلوگیری از Stop شدن)
+# =========================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+# =========================
 # اجرای ربات
 # =========================
 
@@ -92,8 +109,10 @@ def main():
     create_excel_if_not_exists()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # اجرای health server در ترد جدا
+    threading.Thread(target=run_health_server, daemon=True).start()
 
     print("Bot started...")
     app.run_polling()
