@@ -2,3 +2,5 @@ python-telegram-bot==20.7
 openpyxl
 Pillow
 requests
+pandas
+numpy
