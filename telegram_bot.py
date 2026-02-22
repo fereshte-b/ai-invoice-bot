@@ -1,153 +1,115 @@
 import os
-import io
-import json
-import base64
+import logging
+from datetime import datetime
+
 import openpyxl
-from PIL import Image
+from openpyxl import Workbook
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-from openai import OpenAI
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# =========================
-# ENV VARIABLES (Railway)
-# =========================
+# -----------------------
+# تنظیمات اصلی
+# -----------------------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# مسیر ذخیره اکسل داخل Railway (با Volume)
+EXCEL_FILE_PATH = "/data/invoices.xlsx"
 
-# =========================
-# STORAGE (Railway Volume)
-# =========================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
-IMAGE_FOLDER = "/data/invoice_images"
-os.makedirs(IMAGE_FOLDER, exist_ok=True)
+# -----------------------
+# ساخت فایل اکسل اگر وجود نداشت
+# -----------------------
 
-EXCEL_FILE = "/data/ai_invoices.xlsx"
-
-# =========================
-# IMAGE OPTIMIZATION (کم‌حجم برای کاهش هزینه)
-# =========================
-
-def prepare_image_base64(path):
-    with Image.open(path) as img:
-        img = img.convert("RGB")
-        img.thumbnail((1400, 1400))
-        buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=75, optimize=True)
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-# =========================
-# AI EXTRACTION
-# =========================
-
-def extract_invoice_fields(image_path):
-
-    base64_image = prepare_image_base64(image_path)
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        response_format={"type": "json_object"},
-        temperature=0,
-        max_tokens=200,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": """Extract ONLY these 3 fields from this invoice image:
-
-1) company
-2) invoice_date
-3) final_total
-
-Return strictly JSON:
-{
-  "company": "...",
-  "invoice_date": "...",
-  "final_total": "..."
-}
-"""
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        }
-                    }
-                ]
-            }
-        ]
-    )
-
-    return json.loads(response.choices[0].message.content)
-
-# =========================
-# SAVE TO EXCEL
-# =========================
-
-def save_to_excel(data):
-
-    if os.path.exists(EXCEL_FILE):
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        ws = wb.active
-    else:
-        wb = openpyxl.Workbook()
+def create_excel_if_not_exists():
+    if not os.path.exists(EXCEL_FILE_PATH):
+        wb = Workbook()
         ws = wb.active
         ws.title = "Invoices"
-        ws.append(["Company", "Invoice Date", "Final Total"])
+        ws.append(["Date", "User ID", "Username", "Message Text"])
+        wb.save(EXCEL_FILE_PATH)
+
+
+# -----------------------
+# اضافه کردن ردیف جدید به اکسل
+# -----------------------
+
+def append_to_excel(user_id, username, text):
+    create_excel_if_not_exists()
+
+    wb = openpyxl.load_workbook(EXCEL_FILE_PATH)
+    ws = wb.active
 
     ws.append([
-        data.get("company", ""),
-        data.get("invoice_date", ""),
-        data.get("final_total", "")
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        user_id,
+        username,
+        text
     ])
 
-    wb.save(EXCEL_FILE)
+    wb.save(EXCEL_FILE_PATH)
 
-# =========================
-# TELEGRAM HANDLER
-# =========================
+
+# -----------------------
+# دستورات تلگرام
+# -----------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("ربات فعال است ✅\nفاکتور یا متن بفرستید.")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text
+
+    append_to_excel(
+        user_id=user.id,
+        username=user.username if user.username else "NoUsername",
+        text=text,
+    )
+
+    await update.message.reply_text("اطلاعات ذخیره شد ✅")
+
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
 
-    photo = await update.message.photo[-1].get_file()
-    file_path = os.path.join(IMAGE_FOLDER, f"{photo.file_id}.jpg")
-    await photo.download_to_drive(file_path)
+    append_to_excel(
+        user_id=user.id,
+        username=user.username if user.username else "NoUsername",
+        text="Photo received"
+    )
 
-    try:
-        result = extract_invoice_fields(file_path)
-        save_to_excel(result)
+    await update.message.reply_text("عکس دریافت و ثبت شد ✅")
 
-        await update.message.reply_text(
-            f"✅ Saved to Excel\n\n"
-            f"Company: {result['company']}\n"
-            f"Date: {result['invoice_date']}\n"
-            f"Total: {result['final_total']}"
-        )
 
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-# =========================
-# MAIN
-# =========================
+# -----------------------
+# اجرای اصلی
+# -----------------------
 
 def main():
-
-    if not OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY not set")
-
     if not TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_TOKEN not set")
+        raise ValueError("TELEGRAM_TOKEN not set in environment variables")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    print("🤖 AI Invoice Bot running on Railway...")
+    print("Bot is running...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
