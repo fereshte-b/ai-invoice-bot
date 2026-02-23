@@ -1,80 +1,81 @@
 import os
 import logging
-from datetime import datetime
-from openpyxl import Workbook, load_workbook
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+import pandas as pd
+import requests
 
-logging.basicConfig(level=logging.INFO)
+# ---------------- CONFIG ---------------- #
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-PORT = int(os.getenv("PORT", 8080))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL")
+PORT = int(os.getenv("PORT", 8080))
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN not set")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not set")
 
 if not RAILWAY_STATIC_URL:
     raise ValueError("RAILWAY_STATIC_URL not set")
 
-DATA_DIR = "/data"
-EXCEL_FILE = os.path.join(DATA_DIR, "invoices.xlsx")
+EXCEL_PATH = "/data/invoices.xlsx"
 
+logging.basicConfig(level=logging.INFO)
 
-def create_excel_if_not_exists():
-    if not os.path.exists(DATA_DIR):
-        os.makedirs(DATA_DIR)
-
-    if not os.path.exists(EXCEL_FILE):
-        wb = Workbook()
-        ws = wb.active
-        ws.append(["Date", "User ID", "Username", "File Name"])
-        wb.save(EXCEL_FILE)
-
-
-def save_to_excel(user_id, username, file_name):
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb.active
-    ws.append([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        user_id,
-        username,
-        file_name
-    ])
-    wb.save(EXCEL_FILE)
-
+# ---------------- PHOTO HANDLER ---------------- #
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+
     photo = update.message.photo[-1]
-
     file = await context.bot.get_file(photo.file_id)
-    image_path = os.path.join(DATA_DIR, f"{photo.file_id}.jpg")
-    await file.download_to_drive(image_path)
 
-    save_to_excel(
-        user.id,
-        user.username if user.username else "NoUsername",
-        image_path
+    file_path = "/data/last_photo.jpg"
+    await file.download_to_drive(file_path)
+
+    # اینجا فعلاً فقط نمونه دیتا اضافه می‌کنیم
+    # بعداً میشه OCR واقعی گذاشت
+
+    data = {
+        "User": [update.effective_user.first_name],
+        "Photo_File": [file_path],
+    }
+
+    df_new = pd.DataFrame(data)
+
+    if os.path.exists(EXCEL_PATH):
+        df_existing = pd.read_excel(EXCEL_PATH)
+        df_final = pd.concat([df_existing, df_new], ignore_index=True)
+    else:
+        df_final = df_new
+
+    df_final.to_excel(EXCEL_PATH, index=False)
+
+    await update.message.reply_text("اکسل بروزرسانی شد ✅")
+
+    await update.message.reply_document(
+        document=open(EXCEL_PATH, "rb"),
+        filename="invoices.xlsx"
     )
 
-    await update.message.reply_text("✅ عکس ثبت شد")
-
+# ---------------- MAIN ---------------- #
 
 def main():
-    create_excel_if_not_exists()
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    webhook_url = f"https://{RAILWAY_STATIC_URL}/"
+    webhook_url = f"https://{RAILWAY_STATIC_URL}"
 
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        webhook_url=webhook_url
+        webhook_url=webhook_url,
     )
-
 
 if __name__ == "__main__":
     main()
