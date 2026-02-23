@@ -1,7 +1,4 @@
 python-telegram-bot[webhooks]==20.7
-openpyxl
-Pillow
-requests
 pandas
-numpy
-
+openpyxl
+openai
