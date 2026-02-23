@@ -1,37 +1,25 @@
 import os
 import logging
-import threading
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
 from openpyxl import Workbook, load_workbook
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-# =========================
-# تنظیمات اصلی
-# =========================
+logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+PORT = int(os.getenv("PORT", 8080))
+RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL")
 
 if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN not set in environment variables")
+    raise ValueError("TELEGRAM_TOKEN not set")
+
+if not RAILWAY_STATIC_URL:
+    raise ValueError("RAILWAY_STATIC_URL not set")
 
 DATA_DIR = "/data"
 EXCEL_FILE = os.path.join(DATA_DIR, "invoices.xlsx")
 
-# =========================
-# لاگ‌گیری
-# =========================
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
-# =========================
-# ساخت فایل اکسل اگر وجود نداشت
-# =========================
 
 def create_excel_if_not_exists():
     if not os.path.exists(DATA_DIR):
@@ -40,14 +28,9 @@ def create_excel_if_not_exists():
     if not os.path.exists(EXCEL_FILE):
         wb = Workbook()
         ws = wb.active
-        ws.title = "Invoices"
         ws.append(["Date", "User ID", "Username", "File Name"])
         wb.save(EXCEL_FILE)
-        print("Excel file created at:", EXCEL_FILE)
 
-# =========================
-# ذخیره اطلاعات در اکسل
-# =========================
 
 def save_to_excel(user_id, username, file_name):
     wb = load_workbook(EXCEL_FILE)
@@ -59,24 +42,15 @@ def save_to_excel(user_id, username, file_name):
         file_name
     ])
     wb.save(EXCEL_FILE)
-    print("Saved to Excel:", file_name)
 
-# =========================
-# هندلر دریافت عکس
-# =========================
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("PHOTO RECEIVED")
-
     user = update.effective_user
     photo = update.message.photo[-1]
 
     file = await context.bot.get_file(photo.file_id)
-
     image_path = os.path.join(DATA_DIR, f"{photo.file_id}.jpg")
     await file.download_to_drive(image_path)
-
-    print("Image saved at:", image_path)
 
     save_to_excel(
         user.id,
@@ -84,26 +58,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_path
     )
 
-    await update.message.reply_text("✅ عکس دریافت و ثبت شد")
+    await update.message.reply_text("✅ عکس ثبت شد")
 
-# =========================
-# Railway Health Server (برای جلوگیری از Stop شدن)
-# =========================
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
-
-# =========================
-# اجرای ربات
-# =========================
 
 def main():
     create_excel_if_not_exists()
@@ -111,11 +67,14 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # اجرای health server در ترد جدا
-    threading.Thread(target=run_health_server, daemon=True).start()
+    webhook_url = f"https://{RAILWAY_STATIC_URL}/"
 
-    print("Bot started...")
-    app.run_polling()
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=webhook_url
+    )
+
 
 if __name__ == "__main__":
     main()
