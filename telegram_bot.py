@@ -47,11 +47,17 @@ Extract from this invoice and return ONLY JSON:
   "date": "",
   "supplier": "",
   "net_total": "",
-  "vat_amount": ""
+  "vat_amount": "",
+  "sub_category": ""
 }
+
+Sub-category must be one of:
+Gas, Grocery, Restaurant, Office Supplies, Utilities, Transport, Maintenance, Other
 
 If VAT amount exists return the number.
 If VAT does not exist return null.
+
+Return JSON only.
 """},
                     {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"}
                 ],
@@ -74,9 +80,9 @@ If VAT does not exist return null.
         data.get("date", ""),
         data.get("supplier", ""),
         data.get("net_total", ""),
-        vat_flag
+        vat_flag,
+        data.get("sub_category", "Other")
     ]
-
 # -------- Telegram Handler -------- #
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,7 +97,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sheet.values().append(
         spreadsheetId=SHEET_ID,
-        range="A:D",
+        range="A:E",
         valueInputOption="USER_ENTERED",
         body={"values": [row]}
     ).execute()
@@ -107,3 +113,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
