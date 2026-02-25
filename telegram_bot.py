@@ -72,11 +72,8 @@ def get_spreadsheet():
     return gc.open_by_key(GOOGLE_SHEET_ID)
 
 
-def get_or_create_ws(sh, name):
-    try:
-        return sh.worksheet(name)
-    except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=name, rows=2000, cols=20)
+def get_ws(sh, name):
+    return sh.worksheet(name)
 
 
 def ensure_header(ws, header):
@@ -241,3 +238,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
