@@ -3,7 +3,7 @@ import json
 import base64
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import List, Dict, Any
 
 from openai import OpenAI
 import gspread
@@ -13,7 +13,6 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -37,8 +36,6 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set")
 if not OPENAI_API_KEY:
@@ -51,35 +48,29 @@ if not (GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64):
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ----------------------------
-# Google Sheet
+# Google Sheets (NO creation)
 # ----------------------------
-def _load_service_account_info():
-    if GOOGLE_SERVICE_ACCOUNT_JSON:
-        return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode()
-    return json.loads(decoded)
-
-
 def get_spreadsheet():
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        sa_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    else:
+        decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode()
+        sa_info = json.loads(decoded)
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(
-        _load_service_account_info(), scopes=scopes
-    )
+
+    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
     gc = gspread.authorize(creds)
+
     return gc.open_by_key(GOOGLE_SHEET_ID)
 
 
 def get_ws(sh, name):
+    # فقط بگیر، نساز
     return sh.worksheet(name)
-
-
-def ensure_header(ws, header):
-    first_row = ws.row_values(1)
-    if first_row != header:
-        ws.update(f"A1:{chr(64+len(header))}1", [header])
 
 
 # ----------------------------
@@ -89,11 +80,12 @@ def clean_json_only(text: str) -> str:
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1:
-        raise ValueError("Invalid JSON from model")
-    return text[start : end + 1]
+        raise ValueError("Model did not return valid JSON.")
+    return text[start:end+1]
 
 
 def extract_with_ai(image_bytes: bytes):
+
     b64 = base64.b64encode(image_bytes).decode()
 
     prompt = """
@@ -118,19 +110,22 @@ Extract invoice data and return ONLY JSON:
 
 Rules:
 - net_total = final payable amount.
-- vat_amount = total VAT for invoice (null if none).
-- items: include per-item discount and vat if shown, else "".
+- vat_amount = total VAT of invoice (null if none).
+- If per-item discount or vat not visible, return "".
 - Return JSON only.
 """
 
     resp = client.responses.create(
-        model=OPENAI_MODEL,
+        model="gpt-4o-mini",
         input=[
             {
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": f"data:image/jpeg;base64,{b64}"},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{b64}",
+                    },
                 ],
             }
         ],
@@ -148,11 +143,15 @@ Rules:
 
     vat_flag = "Yes" if vat_amount else "No"
 
-    items = data.get("items") or []
-
     return {
-        "summary": [date_val, supplier_val, net_total, vat_flag, subcat],
-        "items": items,
+        "summary_row": [
+            date_val,
+            supplier_val,
+            net_total,
+            vat_flag,
+            subcat,
+        ],
+        "items": data.get("items", []),
         "date": date_val,
         "supplier": supplier_val,
     }
@@ -162,6 +161,7 @@ Rules:
 # Telegram
 # ----------------------------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     msg = update.message
     if not msg or not msg.photo:
         return
@@ -177,27 +177,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sh = get_spreadsheet()
 
-        # -------- Sheet 1 (Invoices) --------
+        # -------- Invoices (Sheet 1)
         ws1 = get_ws(sh, "Invoices")
-        header1 = ["Date", "Supplier", "Net Total", "VAT", "Sub-Category"]
-        ensure_header(ws1, header1)
-        ws1.append_row(result["summary"], value_input_option="USER_ENTERED")
+        ws1.append_row(result["summary_row"], value_input_option="USER_ENTERED")
 
-        # -------- Sheet 2 (Detailed_Items) --------
+        # -------- Detailed_Items (Sheet 2)
         ws2 = get_ws(sh, "Detailed_Items")
-        header2 = [
-            "date",
-            "supplier",
-            "product description",
-            "quantity",
-            "rate",
-            "discount",
-            "vat",
-            "total price",
-        ]
-        ensure_header(ws2, header2)
 
         for item in result["items"]:
+
             name = str(item.get("name", "")).strip()
             qty = float(item.get("qty") or 0)
             rate = float(item.get("rate") or 0)
@@ -219,10 +207,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             ws2.append_row(row, value_input_option="USER_ENTERED")
 
-        await msg.reply_text("✅ ثبت شد در ai invoices (هر دو شیت).")
+        await msg.reply_text("✅ ثبت شد در AI invoices (هر دو شیت).")
 
     except Exception as e:
-        logger.exception("Error")
+        logger.exception("Error processing invoice")
         await msg.reply_text(f"❌ خطا: {e}")
 
 
@@ -238,5 +226,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
