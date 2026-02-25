@@ -178,13 +178,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sh = get_spreadsheet()
 
         # -------- Sheet 1 (Invoices) --------
-        ws1 = get_or_create_ws(sh, "Invoices")
+        ws1 = get_ws(sh, "Invoices")
         header1 = ["Date", "Supplier", "Net Total", "VAT", "Sub-Category"]
         ensure_header(ws1, header1)
         ws1.append_row(result["summary"], value_input_option="USER_ENTERED")
 
         # -------- Sheet 2 (Detailed_Items) --------
-        ws2 = get_or_create_ws(sh, "Detailed_Items")
+        ws2 = get_ws(sh, "Detailed_Items")
         header2 = [
             "date",
             "supplier",
@@ -238,4 +238,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
