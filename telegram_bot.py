@@ -3,10 +3,9 @@ import json
 import base64
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from openai import OpenAI
-
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -29,132 +28,79 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai-invoice-bot")
 
-
 # ----------------------------
-# ENV Vars
+# ENV
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # Spreadsheet ID
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Invoices")  # Worksheet name
-
-# Service account JSON:
-# Either set GOOGLE_SERVICE_ACCOUNT_JSON (raw json)
-# or GOOGLE_SERVICE_ACCOUNT_JSON_B64 (base64 of json)
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_SERVICE_ACCOUNT_JSON_B64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
 
-# Optional: force model
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# ----------------------------
-# Validate required envs
-# ----------------------------
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set")
-
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY not set")
-
 if not GOOGLE_SHEET_ID:
     raise ValueError("GOOGLE_SHEET_ID not set")
-
 if not (GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64):
-    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64 not set")
+    raise ValueError("Google service account not set")
 
-
-# ----------------------------
-# Clients
-# ----------------------------
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-def _load_service_account_info() -> Dict[str, Any]:
+# ----------------------------
+# Google Sheet
+# ----------------------------
+def _load_service_account_info():
     if GOOGLE_SERVICE_ACCOUNT_JSON:
         return json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-
-    # else b64
-    decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64.encode("utf-8")).decode("utf-8")
+    decoded = base64.b64decode(GOOGLE_SERVICE_ACCOUNT_JSON_B64).decode()
     return json.loads(decoded)
 
 
-def get_sheet():
-    """
-    Opens the Google Sheet and returns the worksheet.
-    """
-    sa_info = _load_service_account_info()
+def get_spreadsheet():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+    creds = Credentials.from_service_account_info(
+        _load_service_account_info(), scopes=scopes
+    )
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
+    return gc.open_by_key(GOOGLE_SHEET_ID)
+
+
+def get_or_create_ws(sh, name):
     try:
-        ws = sh.worksheet(GOOGLE_SHEET_NAME)
+        return sh.worksheet(name)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=GOOGLE_SHEET_NAME, rows=1000, cols=20)
-    return ws
+        return sh.add_worksheet(title=name, rows=2000, cols=20)
 
 
-def ensure_header(ws):
-    """
-    Ensures header exists exactly as requested.
-    """
-    header = ["Date", "Supplier", "Net Total", "VAT", "Sub-Category", "Items"]
+def ensure_header(ws, header):
     first_row = ws.row_values(1)
     if first_row != header:
-        # If sheet is empty or wrong header, set it
-        ws.resize(rows=max(ws.row_count, 2), cols=max(ws.col_count, len(header)))
-        ws.update("A1:F1", [header])
+        ws.update(f"A1:{chr(64+len(header))}1", [header])
 
 
-def normalize_yes_no_vat(vat_amount: Any) -> str:
-    """
-    VAT column should be Yes if vat_amount exists and is not 0.
-    Otherwise No.
-    """
-    if vat_amount is None:
-        return "No"
-    if isinstance(vat_amount, (int, float)):
-        return "Yes" if vat_amount != 0 else "No"
-    s = str(vat_amount).strip()
-    if s == "" or s.lower() in ("null", "none"):
-        return "No"
-    # remove commas/spaces
-    s2 = s.replace(",", "").replace(" ", "")
-    # if numeric and zero
-    try:
-        val = float(s2)
-        return "Yes" if val != 0 else "No"
-    except Exception:
-        # non-numeric but something exists -> Yes
-        return "Yes"
-
-
+# ----------------------------
+# AI Extraction
+# ----------------------------
 def clean_json_only(text: str) -> str:
-    """
-    Extracts first {...} JSON block from model output.
-    """
-    text = text.strip()
     start = text.find("{")
     end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("Model did not return JSON.")
+    if start == -1 or end == -1:
+        raise ValueError("Invalid JSON from model")
     return text[start : end + 1]
 
 
-def extract_with_ai(image_bytes: bytes) -> List[Any]:
-    """
-    Extracts date, supplier, net_total, vat_amount, sub_category, items(list)
-    then returns row values:
-    [Date, Supplier, Net Total, VAT(Yes/No), Sub-Category, Items(text)]
-    """
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
+def extract_with_ai(image_bytes: bytes):
+    b64 = base64.b64encode(image_bytes).decode()
 
     prompt = """
-Extract from this invoice image and return ONLY JSON in this exact schema:
+Extract invoice data and return ONLY JSON:
 
 {
   "date": "",
@@ -163,21 +109,21 @@ Extract from this invoice image and return ONLY JSON in this exact schema:
   "vat_amount": null,
   "sub_category": "",
   "items": [
-    {"name": "", "qty": "", "price": ""}
+    {
+      "name": "",
+      "qty": "",
+      "rate": "",
+      "discount": "",
+      "vat": ""
+    }
   ]
 }
 
 Rules:
-- date: best-effort. If missing, return empty string.
-- supplier: store/company name if available; otherwise empty string.
-- net_total: final payable total (Net total). If unknown, empty string.
-- vat_amount: if VAT exists, return the VAT numeric amount (or string if shown). If no VAT, return null.
-- sub_category must be one of:
-  Gas, Grocery, Restaurant, Office Supplies, Utilities, Transport, Maintenance, Other
-  If uncertain, use "Other".
-- items: include line items if visible. If not visible, return empty list [].
-
-Return JSON only. No extra text.
+- net_total = final payable amount.
+- vat_amount = total VAT for invoice (null if none).
+- items: include per-item discount and vat if shown, else "".
+- Return JSON only.
 """
 
     resp = client.responses.create(
@@ -195,114 +141,101 @@ Return JSON only. No extra text.
     )
 
     raw = resp.output_text or ""
-    json_text = clean_json_only(raw)
-    data = json.loads(json_text)
+    data = json.loads(clean_json_only(raw))
 
-    vat_flag = normalize_yes_no_vat(data.get("vat_amount"))
+    date_val = data.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    supplier_val = data.get("supplier", "")
+    net_total = data.get("net_total", "")
+    vat_amount = data.get("vat_amount")
+    subcat = data.get("sub_category", "Other")
 
-    # Items into a single cell (multi-line)
-    items_text_lines: List[str] = []
+    vat_flag = "Yes" if vat_amount else "No"
+
     items = data.get("items") or []
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name", "")).strip()
-            qty = str(item.get("qty", "")).strip()
-            price = str(item.get("price", "")).strip()
-            # Skip totally empty rows
-            if not (name or qty or price):
-                continue
-            # Format: Name (qty × price)
-            if qty and price:
-                items_text_lines.append(f"{name} ({qty} × {price})".strip())
-            else:
-                # fallback format
-                parts = [p for p in [name, qty, price] if p]
-                items_text_lines.append(" - ".join(parts).strip())
 
-    items_text = "\n".join(items_text_lines).strip()
-
-    # If date empty, fill with today's UTC as fallback (optional)
-    date_val = str(data.get("date", "")).strip()
-    supplier_val = str(data.get("supplier", "")).strip()
-    net_total_val = str(data.get("net_total", "")).strip()
-    subcat_val = str(data.get("sub_category", "Other")).strip() or "Other"
-
-    # Keep Date as extracted if exists; otherwise use current local timestamp-like string
-    if not date_val:
-        date_val = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    return [date_val, supplier_val, net_total_val, vat_flag, subcat_val, items_text]
+    return {
+        "summary": [date_val, supplier_val, net_total, vat_flag, subcat],
+        "items": items,
+        "date": date_val,
+        "supplier": supplier_val,
+    }
 
 
 # ----------------------------
-# Telegram Handlers
+# Telegram
 # ----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "سلام 😊\n"
-        "عکس فاکتور رو بفرست تا اطلاعاتش رو با AI استخراج کنم و داخل Google Sheet ذخیره کنم.\n\n"
-        "ستون‌ها: Date / Supplier / Net Total / VAT / Sub-Category / Items"
-    )
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "راهنما:\n"
-        "1) فقط عکس فاکتور رو بفرست.\n"
-        "2) من اطلاعات رو با AI استخراج می‌کنم.\n"
-        "3) خروجی داخل Google Sheets ذخیره می‌شه.\n"
-        "4) VAT فقط Yes/No هست.\n"
-        "5) Items داخل یک سلول چندخطی ذخیره می‌شه."
-    )
-
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not msg.photo:
         return
 
     try:
-        await msg.chat.send_action(action=ChatAction.TYPING)
+        await msg.chat.send_action(ChatAction.TYPING)
 
-        # Get best quality photo
         photo = msg.photo[-1]
         file = await context.bot.get_file(photo.file_id)
-
-        # Download bytes
         image_bytes = await file.download_as_bytearray()
-        image_bytes = bytes(image_bytes)
 
-        # Extract data with AI
-        await msg.chat.send_action(action=ChatAction.TYPING)
-        row = extract_with_ai(image_bytes)
+        result = extract_with_ai(bytes(image_bytes))
 
-        # Save to Google Sheet
-        ws = get_sheet()
-        ensure_header(ws)
-        ws.append_row(row, value_input_option="USER_ENTERED")
+        sh = get_spreadsheet()
 
-        await msg.reply_text("✅ ثبت شد و داخل Google Sheet ذخیره شد.")
+        # -------- Sheet 1 (Invoices) --------
+        ws1 = get_or_create_ws(sh, "Invoices")
+        header1 = ["Date", "Supplier", "Net Total", "VAT", "Sub-Category"]
+        ensure_header(ws1, header1)
+        ws1.append_row(result["summary"], value_input_option="USER_ENTERED")
+
+        # -------- Sheet 2 (Detailed_Items) --------
+        ws2 = get_or_create_ws(sh, "Detailed_Items")
+        header2 = [
+            "date",
+            "supplier",
+            "product description",
+            "quantity",
+            "rate",
+            "discount",
+            "vat",
+            "total price",
+        ]
+        ensure_header(ws2, header2)
+
+        for item in result["items"]:
+            name = str(item.get("name", "")).strip()
+            qty = float(item.get("qty") or 0)
+            rate = float(item.get("rate") or 0)
+            discount = float(item.get("discount") or 0)
+            vat = float(item.get("vat") or 0)
+
+            total_price = (qty * rate) - discount + vat
+
+            row = [
+                result["date"],
+                result["supplier"],
+                name,
+                qty,
+                rate,
+                discount,
+                vat,
+                total_price,
+            ]
+
+            ws2.append_row(row, value_input_option="USER_ENTERED")
+
+        await msg.reply_text("✅ ثبت شد در ai invoices (هر دو شیت).")
 
     except Exception as e:
-        logger.exception("Failed to process photo")
+        logger.exception("Error")
         await msg.reply_text(f"❌ خطا: {e}")
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled error", exc_info=context.error)
-
-
+# ----------------------------
+# Main
+# ----------------------------
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_error_handler(error_handler)
-
-    logger.info("Bot is running (polling)...")
+    logger.info("Bot running...")
     app.run_polling(drop_pending_updates=True)
 
 
