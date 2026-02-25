@@ -201,7 +201,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ws2 = get_ws(sh, "Detailed_Items")
 
         # Sheet 1 (added paid by column)
-        ws1.append_row([
+      ws1.append_row([
     result["date"],
     result["supplier"],
     result["net_total"],
@@ -210,7 +210,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result.get("items_text", ""),
     paid_by
 ], value_input_option="USER_ENTERED")
-        # Sheet 2 (added paid by column)
+   
+# Sheet 2 (added paid by column)
         items = result["items"]
 
         if items:
@@ -272,4 +273,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
