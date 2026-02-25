@@ -288,8 +288,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
                 ws2.append_row(row2, value_input_option="USER_ENTERED")
 
-        await msg.reply_text("✅ ثبت شد (VAT دقیق‌تر + Category/Items اصلاح شد).")
-
+        await msg.reply_text("با موفقیت ثبت شد")
+    
     except Exception as e:
         logger.exception("Error processing invoice")
         # پیام خطا کوتاه و مفید
@@ -306,3 +306,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
