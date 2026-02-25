@@ -3,7 +3,7 @@ import json
 import base64
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 import gspread
@@ -44,7 +44,7 @@ if not OPENAI_API_KEY:
 if not GOOGLE_SHEET_ID:
     raise ValueError("GOOGLE_SHEET_ID not set")
 if not (GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64):
-    raise ValueError("Google service account not set")
+    raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64 not set")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -67,6 +67,7 @@ def get_spreadsheet():
     return gc.open_by_key(GOOGLE_SHEET_ID)
 
 def get_ws(sh, name: str):
+    # فقط بگیر، نساز
     return sh.worksheet(name)
 
 # ----------------------------
@@ -80,10 +81,12 @@ def clean_json_only(text: str) -> str:
         raise ValueError("Model did not return valid JSON.")
     return text[start:end+1]
 
+def safe_str(x: Any) -> str:
+    return str(x).strip() if x is not None else ""
+
 def to_number(value: Any) -> Optional[float]:
     """
-    Converts '0', '0.000', ' 3,960 ' to float.
-    Returns None if empty/invalid.
+    Converts '0', '0.000', ' 3,960 ' to float. Returns None if empty/invalid.
     """
     if value is None:
         return None
@@ -107,8 +110,39 @@ def vat_yes_no(vat_amount: Any) -> str:
         return "No"
     return "Yes" if num > 0 else "No"
 
-def safe_str(x: Any) -> str:
-    return str(x).strip() if x is not None else ""
+def normalize_date_yyyy_mm_dd_slash(raw: Any) -> str:
+    """
+    Always returns YYYY/MM/DD (e.g., 2022/02/24)
+    """
+    s = str(raw).strip() if raw is not None else ""
+    if not s:
+        return datetime.now(timezone.utc).strftime("%Y/%m/%d")
+
+    fmts = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%y",
+        "%d/%m/%y",
+        "%d-%b-%y",
+        "%d-%b-%Y",
+        "%d %b %Y",
+        "%d %B %Y",
+    ]
+    for f in fmts:
+        try:
+            dt = datetime.strptime(s, f)
+            return dt.strftime("%Y/%m/%d")
+        except Exception:
+            pass
+
+    # ISO fallback (sometimes includes time)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%Y/%m/%d")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y/%m/%d")
 
 # ----------------------------
 # AI Extraction
@@ -128,13 +162,20 @@ Return ONLY JSON in this exact schema:
   "vat_amount": null,
   "sub_category": "",
   "items": [
-    { "name": "", "qty": "", "rate": "", "discount": "", "vat": "" }
+    {
+      "name": "",
+      "qty": "",
+      "rate": "",
+      "discount": "",
+      "vat": "",
+      "line_total": ""
+    }
   ]
 }
 
 Rules (important):
 - date: invoice date. If missing, empty string.
-- supplier: store/company name (seller). If unclear, empty string.
+- supplier: seller/company name. If unclear, empty string.
 - net_total: FINAL payable amount (grand total / net total). If unclear, empty string.
 - vat_amount: TOTAL VAT amount for the invoice.
   - If VAT is not present OR shown as 0.000, return null (NOT "0").
@@ -147,7 +188,8 @@ Rules (important):
   - rate = unit price
   - discount = discount for that line (0 if not shown)
   - vat = VAT for that line (0 if not shown)
-  - If you cannot see line items, return an empty list [] (not dummy items).
+  - line_total = the line net/amount/total shown for that item row (if visible).
+  - If you cannot see line items, return an empty list [].
 Return JSON only. No extra text.
 """
 
@@ -168,11 +210,8 @@ Return JSON only. No extra text.
     raw = resp.output_text or ""
     data = json.loads(clean_json_only(raw))
 
-    # ---- Normalize fields ----
-    date_val = safe_str(data.get("date"))
-    if not date_val:
-        date_val = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
+    # ---- Normalize header fields ----
+    date_val = normalize_date_yyyy_mm_dd_slash(data.get("date"))
     supplier_val = safe_str(data.get("supplier"))
     net_total_val = safe_str(data.get("net_total"))
 
@@ -182,12 +221,13 @@ Return JSON only. No extra text.
         subcat_val = "Other"
 
     vat_flag = vat_yes_no(data.get("vat_amount"))
+    invoice_vat_no = (vat_flag == "No")
 
     items = data.get("items") or []
     if not isinstance(items, list):
         items = []
 
-    # Build items text for Sheet1 (so Items column doesn't stay empty if items exist)
+    # Build items text for sheet1
     items_text_lines: List[str] = []
     for it in items:
         if not isinstance(it, dict):
@@ -197,32 +237,37 @@ Return JSON only. No extra text.
         rate = safe_str(it.get("rate"))
         disc = safe_str(it.get("discount"))
         vat_i = safe_str(it.get("vat"))
-        if not (name or qty or rate or disc or vat_i):
+        line_total = safe_str(it.get("line_total"))
+        if not (name or qty or rate or disc or vat_i or line_total):
             continue
-        # Nice compact line
-        # ex: Chicken Wings | qty 6 | rate 0.660 | disc 0 | vat 0
         parts = []
         if name: parts.append(name)
         if qty: parts.append(f"qty {qty}")
         if rate: parts.append(f"rate {rate}")
         if disc: parts.append(f"disc {disc}")
         if vat_i: parts.append(f"vat {vat_i}")
+        if line_total: parts.append(f"line {line_total}")
         items_text_lines.append(" | ".join(parts))
 
     items_text = "\n".join(items_text_lines).strip()
+
+    # If no items extracted, put a clear marker in Sheet1
+    if not items_text:
+        items_text = "UNREADABLE_ITEMS"
 
     return {
         "date": date_val,
         "supplier": supplier_val,
         "net_total": net_total_val,
         "vat_flag": vat_flag,
+        "invoice_vat_no": invoice_vat_no,
         "sub_category": subcat_val,
         "items": items,
         "items_text": items_text,
     }
 
 # ----------------------------
-# Telegram
+# Telegram Handler
 # ----------------------------
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -240,11 +285,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         sh = get_spreadsheet()
 
-        # ✅ IMPORTANT: your sheet tab is "invoices" (lowercase) based on your screenshot
+        # شیت اول طبق اسکرین‌شات شما:
         ws1 = get_ws(sh, "invoices")
         ws2 = get_ws(sh, "Detailed_Items")
 
-        # Sheet1 row (Date, Supplier, Net Total, VAT, Sub-Category, Items)
+        # Sheet1: Date, Supplier, Net Total, VAT, Sub-Category, Items
         row1 = [
             result["date"],
             result["supplier"],
@@ -255,26 +300,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         ws1.append_row(row1, value_input_option="USER_ENTERED")
 
-        # Sheet2 rows per item
+        # Sheet2: per item
         items: List[Dict[str, Any]] = result["items"]
 
-        # اگر هیچ آیتمی دیده نشد، شیت دوم رو خالی می‌ذاریم (تا داده اشتباه وارد نشه)
         if items:
+            wrote_any = False
             for item in items:
                 if not isinstance(item, dict):
                     continue
 
                 name = safe_str(item.get("name"))
-                qty = to_number(item.get("qty")) or 0.0
-                rate = to_number(item.get("rate")) or 0.0
-                discount = to_number(item.get("discount")) or 0.0
-                vat_i = to_number(item.get("vat")) or 0.0
-
-                # اگر name هم خالیه، رد کن
                 if not name:
                     continue
 
-                total_price = (qty * rate) - discount + vat_i
+                qty = to_number(item.get("qty")) or 0.0
+                rate = to_number(item.get("rate")) or 0.0
+                discount = to_number(item.get("discount")) or 0.0
+
+                # ✅ Fix VAT on Sheet2: if invoice VAT is No => force 0
+                vat_i = 0.0 if result["invoice_vat_no"] else (to_number(item.get("vat")) or 0.0)
+
+                # ✅ Prefer AI line_total if provided, else compute
+                line_total_num = to_number(item.get("line_total"))
+                if line_total_num is not None:
+                    total_price = line_total_num
+                else:
+                    total_price = (qty * rate) - discount + vat_i
 
                 row2 = [
                     result["date"],
@@ -287,12 +338,43 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     total_price,
                 ]
                 ws2.append_row(row2, value_input_option="USER_ENTERED")
+                wrote_any = True
+
+            # اگر items بود ولی هیچکدوم قابل ثبت نبود، یک ردیف هشدار بزن
+            if not wrote_any:
+                ws2.append_row(
+                    [
+                        result["date"],
+                        result["supplier"],
+                        "UNREADABLE_ITEMS",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "",
+                    ],
+                    value_input_option="USER_ENTERED",
+                )
+        else:
+            # اگر items خالی بود، یک ردیف هشدار ثبت کن
+            ws2.append_row(
+                [
+                    result["date"],
+                    result["supplier"],
+                    "UNREADABLE_ITEMS",
+                    "",
+                    "",
+                    "",
+                    0,
+                    "",
+                ],
+                value_input_option="USER_ENTERED",
+            )
 
         await msg.reply_text("با موفقیت ثبت شد")
-    
+
     except Exception as e:
         logger.exception("Error processing invoice")
-        # پیام خطا کوتاه و مفید
         await msg.reply_text(f"❌ خطا: {e}")
 
 # ----------------------------
@@ -301,9 +383,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    logger.info("Bot running...")
+    logger.info("Bot is running (polling)...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
